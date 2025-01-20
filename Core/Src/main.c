@@ -1,9 +1,8 @@
-
 /**
-  **************************
+  **********
   * @file           : main.c
   * @brief          : Main program body
-  **************************
+  **********
   * @attention
   *
   * Copyright (c) 2025 STMicroelectronics.
@@ -13,7 +12,7 @@
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
-  **************************
+  **********
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -52,6 +51,8 @@ I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 osSemaphoreId_t sensorSemaphoreHandle = NULL; // Semaphore handle for synchronization
 osSemaphoreId_t taskSyncSemaphoreHandle = NULL;
+osMutexId_t tempPressMutexHandle;
+
 
 UART_HandleTypeDef huart1;
 
@@ -76,6 +77,16 @@ const osThreadAttr_t TaskHC_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
+osThreadId_t CommTask;
+const osThreadAttr_t CommTask_attributes = {
+  .name = "TaskComm",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+const osMutexAttr_t tempPressMutex_attributes = {
+    .name = "tempPressMutex"
+};
+
 /* USER CODE BEGIN PV */
 /* USER CODE END PV */
 
@@ -88,6 +99,8 @@ static void MX_I2C2_Init(void);
 //void StartDefaultTask(void *argument);
 void StartTask02(void *argument);
 void StartTask03(void *argument);
+void StartTask04(void *argument);
+//tempPressMutex = osMutexNew(&tempPressMutex_attributes);
 
 /* USER CODE BEGIN PFP */
 /* USER CODE END PFP */
@@ -96,6 +109,7 @@ char mq2_buffer[64];
 
 float temperature = 0.0;
 float pressure = 0.0;
+
 char uart_buffer[64];
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
@@ -209,9 +223,11 @@ int main(void)
   sensorSemaphoreHandle = osSemaphoreNew(1, 1, NULL); // Binary semaphore, initialized to 1 (available)
   /* creation of defaultTask */
 //  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  tempPressMutexHandle = osMutexNew(&tempPressMutex_attributes);
 
   /* creation of TaskDHT */
   TaskDHTHandle = osThreadNew(StartTask02, NULL, &TaskDHT_attributes);
+  CommTask = osThreadNew(StartTask04, NULL, &CommTask_attributes);
 
   /* creation of TaskHC */
   TaskHCHandle = osThreadNew(StartTask03, NULL, &TaskHC_attributes);
@@ -486,29 +502,10 @@ static void MX_GPIO_Init(void)
 * @retval None
 */
 /* USER CODE END Header_StartTask02 */
-void StartTask03(void *argument)
-{
-    BMP280_Init();
-    osDelay(100);  // Small delay to allow sensor stabilization
-
-    for (;;) {
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET);
-        // Wait for Task02 to finish its execution
-        osSemaphoreAcquire(taskSyncSemaphoreHandle, osWaitForever);
-        if (osSemaphoreAcquire(taskSyncSemaphoreHandle, osWaitForever) == osOK) {
-            BMP280_ReadTempPress(&temperature, &pressure);  // Read sensor data
-            snprintf(uart_buffer, sizeof(uart_buffer), "Temp: %.2f C, Press: %.2f hPa\r\n", temperature, pressure);
-            HAL_UART_Transmit(&huart1, (uint8_t *)uart_buffer, strlen(uart_buffer), HAL_MAX_DELAY);
-            osSemaphoreRelease(taskSyncSemaphoreHandle); // Release semaphore
-        }
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
-        osDelay(7000); // Send data every 10 seconds
-    }
-}
-
 void StartTask02(void *argument)
 {
-    for (;;) {
+    for (;;)
+    {
         uint8_t gas_detected = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_11);
 
         if (gas_detected)
@@ -520,11 +517,61 @@ void StartTask02(void *argument)
             snprintf(mq2_buffer, sizeof(mq2_buffer), "MQ-2: No gas detected\r\n");
         }
 
+        // Transmite datele prin HC-05
         HAL_UART_Transmit(&huart1, (uint8_t *)mq2_buffer, strlen(mq2_buffer), HAL_MAX_DELAY);
-        osDelay(10000); // Task02 interval
 
-        // Release semaphore to notify Task03
+        osSemaphoreRelease(taskSyncSemaphoreHandle);  // Eliberează semaforul pentru Task03
+
+        osDelay(1000);  // Task02 interval
+    }
+}
+void StartTask03(void *argument)
+{
+    BMP280_Init();
+
+    for (;;)
+    {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET);
+
+        // Lock mutex to protect access to temperature and pressure
+        tempPressMutexHandle = osMutexNew(&tempPressMutex_attributes);
+        osMutexAcquire(tempPressMutexHandle, osWaitForever);
+
+        // Read data from BMP280
+        BMP280_ReadTempPress(&temperature, &pressure);
+
+        // Unlock mutex after reading data
+        osMutexRelease(tempPressMutexHandle);
+
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+
+        // Release semaphore for Task04 to transmit data
         osSemaphoreRelease(taskSyncSemaphoreHandle);
+
+        osDelay(500);  // Short delay for stability
+    }
+}
+void StartTask04(void *argument)
+{
+	float citire_temp =0;
+	float citire_pres =0;
+    for (;;)
+    {
+        // Wait for the semaphore from Task03 to transmit data
+        osSemaphoreAcquire(taskSyncSemaphoreHandle, osWaitForever);
+
+        // Lock mutex to safely access temperature and pressure
+        osMutexAcquire(tempPressMutexHandle, osWaitForever);
+        citire_temp = temperature;
+        citire_pres = pressure;
+        // Unlock mutex after accessing data
+        osMutexRelease(tempPressMutexHandle);
+        // Transmit data from BMP280
+        snprintf(uart_buffer, sizeof(uart_buffer), "Temp: %.2f C, Press: %.2f hPa\r\n", citire_temp, citire_pres);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buffer, strlen(uart_buffer), HAL_MAX_DELAY);
+
+
+        osDelay(2000);  // Delay between transmissions for Task04
     }
 }
 /**
